@@ -4,13 +4,10 @@ import asyncio
 import subprocess
 import sys
 import re
+import traceback
 from unidecode import unidecode
 
 # ── Ensure Playwright browser binary is installed ─────────────────────────────
-# On Streamlit Community Cloud:
-#   - System libs come from packages.txt (apt) – do NOT use --with-deps
-#   - We install only the browser binary here
-#   - @st.cache_resource runs this once per container boot
 @st.cache_resource(show_spinner="Installing Chromium (first run only) …")
 def _install_playwright():
     result = subprocess.run(
@@ -18,8 +15,6 @@ def _install_playwright():
         capture_output=True,
         text=True,
     )
-    # Return the result instead of raising so the app always starts.
-    # A warning is displayed in the UI when returncode != 0.
     return result.returncode, result.stdout, result.stderr
 
 _pw_code, _pw_out, _pw_err = _install_playwright()
@@ -32,43 +27,74 @@ st.set_page_config(
 )
 
 # ── Custom CSS ────────────────────────────────────────────────────────────────
-st.markdown(
-    """
-    <style>
-    @import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Sans:wght@300;400;600&display=swap');
-    html, body, [class*="css"] { font-family: 'DM Sans', sans-serif; }
-    h1, h2, h3 { font-family: 'Space Mono', monospace; }
-    .stApp { background: #0d0d0d; color: #e8e8e8; }
-    .block-container { padding-top: 2rem; max-width: 1100px; }
-    .title-bar { display: flex; align-items: center; gap: 14px; margin-bottom: 0.25rem; }
-    .badge {
-        background: #00e5a0; color: #000;
-        font-family: 'Space Mono', monospace; font-size: 0.65rem; font-weight: 700;
-        padding: 3px 8px; border-radius: 3px; letter-spacing: 0.08em;
-        text-transform: uppercase; vertical-align: middle;
-    }
-    .metric-box {
-        background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 8px;
-        padding: 1rem 1.5rem; text-align: center;
-    }
-    .metric-num { font-family: 'Space Mono', monospace; font-size: 2rem; font-weight: 700; color: #00e5a0; }
-    .metric-lbl { font-size: 0.8rem; color: #888; text-transform: uppercase; letter-spacing: 0.08em; }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Sans:wght@300;400;600&display=swap');
+html, body, [class*="css"] { font-family: 'DM Sans', sans-serif; }
+h1, h2, h3 { font-family: 'Space Mono', monospace; }
+.stApp { background: #0d0d0d; color: #e8e8e8; }
+.block-container { padding-top: 2rem; max-width: 1100px; }
+.title-bar { display: flex; align-items: center; gap: 14px; margin-bottom: 0.25rem; }
+.badge {
+    background: #00e5a0; color: #000;
+    font-family: 'Space Mono', monospace; font-size: 0.65rem; font-weight: 700;
+    padding: 3px 8px; border-radius: 3px; letter-spacing: 0.08em;
+    text-transform: uppercase; vertical-align: middle;
+}
+.metric-box {
+    background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 8px;
+    padding: 1rem 1.5rem; text-align: center;
+}
+.metric-num { font-family: 'Space Mono', monospace; font-size: 2rem; font-weight: 700; color: #00e5a0; }
+.metric-lbl { font-size: 0.8rem; color: #888; text-transform: uppercase; letter-spacing: 0.08em; }
+</style>
+""", unsafe_allow_html=True)
 
-# ── Show browser install status ───────────────────────────────────────────────
-if _pw_code != 0:
-    st.error(
-        f"⚠️ Chromium install may have failed (exit {_pw_code}). "
-        "Scraping might not work. See details below."
-    )
-    with st.expander("Chromium install log"):
-        st.code(_pw_out or "(no stdout)")
-        st.code(_pw_err or "(no stderr)")
-else:
-    st.sidebar.success("✅ Chromium ready")
+# ── Chromium install status ───────────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("### 🔧 System status")
+    if _pw_code != 0:
+        st.error(f"Chromium install failed (exit {_pw_code})")
+        with st.expander("Install log"):
+            st.code(_pw_out or "(no stdout)")
+            st.code(_pw_err or "(no stderr)")
+    else:
+        st.success("✅ Chromium installed")
+
+    # ── Diagnostic button ─────────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("### 🩺 Diagnostics")
+    if st.button("Test Chromium launch", use_container_width=True):
+        with st.spinner("Launching a test browser page …"):
+            diag_result = subprocess.run(
+                [sys.executable, "-c", """
+import asyncio
+from playwright.async_api import async_playwright
+
+async def test():
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(
+            headless=True,
+            args=["--no-sandbox","--disable-setuid-sandbox","--disable-dev-shm-usage"]
+        )
+        page = await browser.new_page()
+        await page.goto("https://example.com", timeout=15000)
+        title = await page.title()
+        await browser.close()
+        return title
+
+print(asyncio.run(test()))
+"""],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+        if diag_result.returncode == 0:
+            st.success(f"✅ Browser works! Page title: {diag_result.stdout.strip()}")
+        else:
+            st.error("❌ Browser launch failed")
+            st.code(diag_result.stdout)
+            st.code(diag_result.stderr)
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -104,8 +130,8 @@ async def scrape_one(url: str, browser) -> str:
             return match.group(0) if match else text
         except Exception:
             return "not found"
-    except Exception:
-        return "error"
+    except Exception as e:
+        return f"error: {type(e).__name__}"
     finally:
         await page.close()
 
@@ -113,13 +139,20 @@ async def scrape_one(url: str, browser) -> str:
 async def scrape_all(rows: list, progress_cb) -> list:
     from playwright.async_api import async_playwright
 
-    MAX_CONCURRENT = 5
+    MAX_CONCURRENT = 3  # reduced to avoid memory pressure on free tier
     scores = [""] * len(rows)
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
             headless=True,
-            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--single-process",          # critical for constrained containers
+                "--no-zygote",
+            ],
         )
         semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 
@@ -138,15 +171,27 @@ async def scrape_all(rows: list, progress_cb) -> list:
 
 def run_scraper(rows: list, progress_cb) -> list:
     """
-    Run the async scraper from a synchronous Streamlit context.
-    Streamlit/Tornado already owns an event loop on the main thread, so
-    asyncio.run() would raise 'cannot run nested event loop'.
-    Fix: spin up a worker thread with its own fresh event loop.
+    Run async scraper from Streamlit's sync context.
+    Tornado owns the main-thread event loop, so we use a worker thread.
     """
     import concurrent.futures
+    exc_holder = []
+
+    def _run():
+        try:
+            return asyncio.run(scrape_all(rows, progress_cb))
+        except Exception as e:
+            exc_holder.append(e)
+            raise
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(asyncio.run, scrape_all(rows, progress_cb))
-        return future.result()
+        future = pool.submit(_run)
+        try:
+            return future.result(timeout=600)
+        except Exception as e:
+            # Re-raise with full traceback visible in the UI
+            full_tb = traceback.format_exc()
+            raise RuntimeError(f"{e}\n\nFull traceback:\n{full_tb}") from e
 
 
 # ── Streamlit UI ──────────────────────────────────────────────────────────────
@@ -154,7 +199,7 @@ def run_scraper(rows: list, progress_cb) -> list:
 st.markdown(
     '<div class="title-bar">'
     '<h1 style="margin:0">🏃 Betrail Score Scraper</h1>'
-    '<span class="badge">v1.2</span>'
+    '<span class="badge">v1.3</span>'
     "</div>",
     unsafe_allow_html=True,
 )
@@ -185,6 +230,11 @@ if uploaded:
             st.error(f"CSV is missing required columns: {', '.join(missing)}")
             df = None
         else:
+            # Normalise column name casing for internal use
+            df = df.rename(columns={
+                col_lower.get("lastname", "lastname"): "lastname",
+                col_lower.get("firstname", "firstname"): "firstname",
+            })
             st.success(f"✅ Loaded **{len(df)}** runners.")
             with st.expander("Preview (first 5 rows)", expanded=False):
                 st.dataframe(df.head(), use_container_width=True)
@@ -197,6 +247,7 @@ if df is not None:
         total = len(df)
         progress_bar = st.progress(0, text="Initialising …")
         status_text = st.empty()
+        error_box = st.empty()
 
         def update_progress(done: int):
             pct = done / total
@@ -212,7 +263,9 @@ if df is not None:
             try:
                 scores = run_scraper(rows, update_progress)
             except Exception as exc:
-                st.error(f"Scraping failed: {exc}")
+                error_box.error(
+                    f"**Scraping failed.**\n\n```\n{exc}\n```"
+                )
                 st.stop()
 
         progress_bar.progress(1.0, text="Done ✓")
@@ -221,9 +274,9 @@ if df is not None:
         result_df = df.copy()
         result_df["betrail_score"] = scores
 
-        found     = sum(1 for s in scores if s not in ("not found", "error", ""))
+        found     = sum(1 for s in scores if s not in ("not found", "error", "") and not str(s).startswith("error:"))
         not_found = sum(1 for s in scores if s == "not found")
-        errors    = sum(1 for s in scores if s == "error")
+        errors    = sum(1 for s in scores if str(s).startswith("error"))
 
         st.divider()
         c1, c2, c3, c4 = st.columns(4)
@@ -261,9 +314,10 @@ if df is not None:
         display_df = result_df[display_cols].copy()
 
         def style_score(val):
-            if val == "not found":
+            v = str(val)
+            if v == "not found":
                 return "color: #ff6b6b; font-style: italic"
-            if val == "error":
+            if v.startswith("error"):
                 return "color: #ffa94d; font-style: italic"
             return "color: #00e5a0; font-weight: 700; font-family: monospace"
 
