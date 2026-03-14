@@ -67,7 +67,8 @@ with st.sidebar:
 
     if st.button("🔍 Debug scrape this runner", use_container_width=True):
         with st.spinner("Scraping …"):
-            dbg = subprocess.run([sys.executable, "-c", f"""
+            import tempfile, os
+            debug_script = """
 import asyncio, re, sys
 from playwright.async_api import async_playwright
 try:
@@ -81,7 +82,9 @@ XPATH = (
     "app-runner-overview/div/div[1]/div/bt-card[1]/div/div[3]/"
     "div[1]/div/runner-level/div/runner-score/div"
 )
-URL = "{preview_url}"
+
+import sys
+URL = sys.argv[1]
 
 async def run():
     async with async_playwright() as pw:
@@ -97,12 +100,12 @@ async def run():
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/124.0.0.0 Safari/537.36"
             ),
-            viewport={{"width": 1280, "height": 800}},
+            viewport={"width": 1280, "height": 800},
             locale="fr-FR",
-            extra_http_headers={{
+            extra_http_headers={
                 "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            }},
+            },
         )
         page = await ctx.new_page()
         if HAS_STEALTH:
@@ -117,14 +120,12 @@ async def run():
         print("TITLE:", await page.title())
 
         if resp and resp.status == 200:
-            # Wait for Angular
             try:
                 await page.wait_for_selector("runner-score", timeout=15000)
                 print("runner-score element: FOUND")
-            except:
+            except Exception:
                 print("runner-score element: NOT FOUND within 15s")
 
-            # XPath attempt
             try:
                 loc = page.locator("xpath=" + XPATH)
                 await loc.wait_for(timeout=8000)
@@ -132,20 +133,33 @@ async def run():
             except Exception as e:
                 print("XPATH_FAIL:", e)
 
-            # CSS fallback
             try:
                 locs = page.locator("runner-score div")
                 n = await locs.count()
                 print("CSS runner-score div count:", n)
                 for i in range(min(n, 5)):
-                    print(f"  [{i}]:", (await locs.nth(i).inner_text()).strip())
+                    txt = (await locs.nth(i).inner_text()).strip()
+                    print("  [" + str(i) + "]:", txt)
             except Exception as e:
                 print("CSS_FAIL:", e)
 
         await browser.close()
 
 asyncio.run(run())
-"""], capture_output=True, text=True, timeout=90)
+"""
+            # Write to a temp file to avoid f-string escaping issues
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".py",
+                                             delete=False) as tf:
+                tf.write(debug_script)
+                tmp_path = tf.name
+            try:
+                dbg = subprocess.run(
+                    [sys.executable, tmp_path, preview_url],
+                    capture_output=True, text=True, timeout=90
+                )
+            finally:
+                os.unlink(tmp_path)
+
         st.markdown("**Debug output:**")
         st.code(dbg.stdout or "(no stdout)")
         if dbg.stderr:
