@@ -1,28 +1,10 @@
 import streamlit as st
 import pandas as pd
 import asyncio
-import subprocess
-import sys
 import re
+import json
 import traceback
 from unidecode import unidecode
-
-# ── Install Playwright + stealth patch ───────────────────────────────────────
-@st.cache_resource(show_spinner="Installing Chromium (first run only) …")
-def _install_playwright():
-    r1 = subprocess.run(
-        [sys.executable, "-m", "playwright", "install", "chromium"],
-        capture_output=True, text=True,
-    )
-    # Also install playwright-stealth to bypass bot detection
-    r2 = subprocess.run(
-        [sys.executable, "-m", "pip", "install", "playwright-stealth", "--quiet"],
-        capture_output=True, text=True,
-    )
-    code = r1.returncode or r2.returncode
-    return code, r1.stdout + r2.stdout, r1.stderr + r2.stderr
-
-_pw_code, _pw_out, _pw_err = _install_playwright()
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Betrail Score Scraper", page_icon="🏃", layout="wide")
@@ -45,263 +27,229 @@ h1, h2, h3 { font-family: 'Space Mono', monospace; }
 </style>
 """, unsafe_allow_html=True)
 
-# ── Sidebar ───────────────────────────────────────────────────────────────────
-with st.sidebar:
-    st.markdown("### 🔧 System status")
-    if _pw_code != 0:
-        st.error(f"Install failed (exit {_pw_code})")
-        with st.expander("Log"): st.code(_pw_out); st.code(_pw_err)
-    else:
-        st.success("✅ Chromium + stealth ready")
-
-    st.markdown("---")
-    st.markdown("### 🔗 URL preview")
-    t_last  = st.text_input("Lastname",  "CHAVENT", key="diag_last")
-    t_first = st.text_input("Firstname", "Pascal",  key="diag_first")
-
-    def _slug(text):
-        return re.sub(r"[^a-z0-9]+", "", unidecode(str(text)).lower().strip())
-
-    preview_url = f"https://www.betrail.run/runner/{_slug(t_last)}.{_slug(t_first)}/overview"
-    st.code(preview_url, language=None)
-
-    if st.button("🔍 Debug scrape this runner", use_container_width=True):
-        with st.spinner("Scraping …"):
-            import tempfile, os
-            debug_script = """
-import asyncio, re, sys
-from playwright.async_api import async_playwright
-try:
-    from playwright_stealth import stealth_async
-    HAS_STEALTH = True
-except ImportError:
-    HAS_STEALTH = False
-
-XPATH = (
-    "/html/body/app-root/div/div/div/runner-page/div/div/"
-    "app-runner-overview/div/div[1]/div/bt-card[1]/div/div[3]/"
-    "div[1]/div/runner-level/div/runner-score/div"
-)
-
-import sys
-URL = sys.argv[1]
-
-async def run():
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(
-            headless=True,
-            args=["--no-sandbox","--disable-setuid-sandbox",
-                  "--disable-dev-shm-usage","--disable-gpu",
-                  "--single-process","--no-zygote"]
-        )
-        ctx = await browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            viewport={"width": 1280, "height": 800},
-            locale="fr-FR",
-            extra_http_headers={
-                "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            },
-        )
-        page = await ctx.new_page()
-        if HAS_STEALTH:
-            await stealth_async(page)
-            print("STEALTH: enabled")
-        else:
-            print("STEALTH: not available")
-
-        resp = await page.goto(URL, wait_until="domcontentloaded", timeout=30000)
-        print("STATUS:", resp.status if resp else "None")
-        print("URL:", page.url)
-        print("TITLE:", await page.title())
-
-        if resp and resp.status == 200:
-            try:
-                await page.wait_for_selector("runner-score", timeout=15000)
-                print("runner-score element: FOUND")
-            except Exception:
-                print("runner-score element: NOT FOUND within 15s")
-
-            try:
-                loc = page.locator("xpath=" + XPATH)
-                await loc.wait_for(timeout=8000)
-                print("SCORE_XPATH:", (await loc.inner_text()).strip())
-            except Exception as e:
-                print("XPATH_FAIL:", e)
-
-            try:
-                locs = page.locator("runner-score div")
-                n = await locs.count()
-                print("CSS runner-score div count:", n)
-                for i in range(min(n, 5)):
-                    txt = (await locs.nth(i).inner_text()).strip()
-                    print("  [" + str(i) + "]:", txt)
-            except Exception as e:
-                print("CSS_FAIL:", e)
-
-        await browser.close()
-
-asyncio.run(run())
-"""
-            # Write to a temp file to avoid f-string escaping issues
-            with tempfile.NamedTemporaryFile(mode="w", suffix=".py",
-                                             delete=False) as tf:
-                tf.write(debug_script)
-                tmp_path = tf.name
-            try:
-                dbg = subprocess.run(
-                    [sys.executable, tmp_path, preview_url],
-                    capture_output=True, text=True, timeout=90
-                )
-            finally:
-                os.unlink(tmp_path)
-
-        st.markdown("**Debug output:**")
-        st.code(dbg.stdout or "(no stdout)")
-        if dbg.stderr:
-            st.code(dbg.stderr)
-
-# ── Core helpers ──────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def slugify(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", unidecode(str(text)).lower().strip())
 
-def build_url(lastname: str, firstname: str) -> str:
+def build_api_url(lastname: str, firstname: str) -> str:
+    return f"https://www.betrail.run/api/runner/{slugify(lastname)}.{slugify(firstname)}"
+
+def build_referer(lastname: str, firstname: str) -> str:
     return f"https://www.betrail.run/runner/{slugify(lastname)}.{slugify(firstname)}/overview"
 
-XPATH = (
-    "/html/body/app-root/div/div/div/runner-page/div/div/"
-    "app-runner-overview/div/div[1]/div/bt-card[1]/div/div[3]/"
-    "div[1]/div/runner-level/div/runner-score/div"
-)
+def make_headers(cookie: str, lastname: str = "chavent", firstname: str = "pascal") -> dict:
+    return {
+        "accept": "application/json, text/plain, */*",
+        "accept-language": "fr,fr-FR;q=0.9,en;q=0.8",
+        "referer": build_referer(lastname, firstname),
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+        "user-agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/145.0.0.0 Safari/537.36 Edg/145.0.0.0"
+        ),
+        "cookie": cookie,
+    }
 
-BROWSER_ARGS = [
-    "--no-sandbox", "--disable-setuid-sandbox",
-    "--disable-dev-shm-usage", "--disable-gpu",
-    "--single-process", "--no-zygote",
-]
+# ── Score extraction — will be updated once we see the real JSON ──────────────
+# SCORE_KEY will be set to the correct key once the user tests and shares JSON
+SCORE_KEY = st.session_state.get("score_key", "")
 
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36"
-)
+def extract_score(data, score_key: str = "") -> str:
+    """Walk the JSON to find the score value."""
+    if not data:
+        return "not found"
 
-async def make_context(browser):
-    """Create a browser context that looks like a real browser."""
-    return await browser.new_context(
-        user_agent=USER_AGENT,
-        viewport={"width": 1280, "height": 800},
-        locale="fr-FR",
-        extra_http_headers={
-            "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Sec-Fetch-Site": "none",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-User": "?1",
-            "Sec-Fetch-Dest": "document",
-        },
-    )
-
-async def scrape_one(url: str, browser) -> str:
-    try:
-        from playwright_stealth import stealth_async
-        has_stealth = True
-    except ImportError:
-        has_stealth = False
-
-    ctx = await make_context(browser)
-    page = await ctx.new_page()
-    try:
-        if has_stealth:
-            await stealth_async(page)
-
-        resp = await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
-
-        if resp is None:
-            return "error: no response"
-        if resp.status == 403:
-            return "error: 403 blocked"
-        if resp.status == 404:
-            return "not found"
-        if resp.status >= 400:
-            return f"error: HTTP {resp.status}"
-
-        # Wait for Angular to render the score component
+    # If user has configured the exact key path (e.g. "level.score" or "score")
+    if score_key:
+        parts = score_key.split(".")
+        val = data
         try:
-            await page.wait_for_selector("runner-score", timeout=15_000)
-        except Exception:
-            return "not found"
-
-        # Try XPath first
-        try:
-            loc = page.locator(f"xpath={XPATH}")
-            await loc.wait_for(timeout=8_000)
-            text = (await loc.inner_text()).strip()
-            m = re.search(r"[\d,.]+", text)
-            return m.group(0) if m else text
+            for p in parts:
+                val = val[p] if isinstance(val, dict) else val[int(p)]
+            if val not in (None, "", 0):
+                return str(val)
         except Exception:
             pass
 
-        # CSS fallback
-        try:
-            loc2 = page.locator("runner-score div").first
-            await loc2.wait_for(timeout=5_000)
-            text = (await loc2.inner_text()).strip()
-            m = re.search(r"[\d,.]+", text)
-            return m.group(0) if m else (text or "not found")
-        except Exception:
+    # Auto-detect: common score key names used by running/trail apps
+    CANDIDATE_KEYS = [
+        "score", "betrailScore", "betrail_score",
+        "level", "itra", "itraScore", "itra_score",
+        "runnerScore", "runner_score", "index",
+        "performance", "ranking",
+    ]
+    if isinstance(data, dict):
+        # Top-level
+        for k in CANDIDATE_KEYS:
+            if k in data and data[k] not in (None, "", 0):
+                return str(data[k])
+        # One level deep
+        for v in data.values():
+            if isinstance(v, dict):
+                for k in CANDIDATE_KEYS:
+                    if k in v and v[k] not in (None, "", 0):
+                        return str(v[k])
+    return "not found"
+
+# ── Sidebar ───────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("### ⚙️ Configuration")
+
+    cookie_val = st.text_area(
+        "🍪 Cookie (from your browser)",
+        value=st.session_state.get("cookie_val", ""),
+        placeholder="Paste the full Cookie: header value here",
+        height=100,
+        key="cookie_input",
+        help="F12 → Network → /api/runner/... → Request Headers → Cookie"
+    )
+    st.session_state["cookie_val"] = cookie_val
+
+    score_key_input = st.text_input(
+        "🎯 Score JSON key path (fill after test below)",
+        value=st.session_state.get("score_key", ""),
+        placeholder="e.g.  score  or  runner.level  or  data.0.score",
+        help="Dot-separated path to the score in the JSON. Leave blank for auto-detect.",
+        key="score_key_input",
+    )
+    st.session_state["score_key"] = score_key_input
+
+    st.markdown("---")
+    st.markdown("### 🔍 Test one runner")
+
+    t_last  = st.text_input("Lastname",  "CHAVENT", key="diag_last")
+    t_first = st.text_input("Firstname", "Pascal",  key="diag_first")
+    api_url_preview = build_api_url(t_last, t_first)
+    st.code(api_url_preview, language=None)
+
+    if st.button("🧪 Test API call + show JSON", use_container_width=True):
+        if not cookie_val.strip():
+            st.warning("Paste your Cookie header first.")
+        else:
+            import httpx
+            with st.spinner("Calling API …"):
+                try:
+                    hdrs = make_headers(cookie_val.strip(), t_last, t_first)
+                    r = httpx.get(api_url_preview, headers=hdrs,
+                                  timeout=15, follow_redirects=True)
+                    st.write(f"**Status:** `{r.status_code}`")
+                    if r.status_code == 200:
+                        data = r.json()
+                        score = extract_score(data, score_key_input)
+                        if score != "not found":
+                            st.success(f"✅ Score found: **{score}**")
+                        else:
+                            st.warning("⚠️ Score not auto-detected. "
+                                       "Look at the JSON below and fill in the "
+                                       "**Score JSON key path** field above.")
+                        st.markdown("**Full JSON response:**")
+                        st.json(data)
+                    elif r.status_code == 403:
+                        st.error(
+                            "403 — Cloudflare blocked the request. "
+                            "The `cf_clearance` cookie is tied to your browser IP. "
+                            "See explanation below. ⬇️"
+                        )
+                        st.code(r.text[:300])
+                    else:
+                        st.error(f"HTTP {r.status_code}")
+                        st.code(r.text[:300])
+                except Exception as e:
+                    st.error(str(e))
+
+# ── Scraper ───────────────────────────────────────────────────────────────────
+
+async def fetch_score_async(client, lastname: str, firstname: str,
+                             cookie: str, score_key: str) -> str:
+    url = build_api_url(lastname, firstname)
+    try:
+        hdrs = make_headers(cookie, lastname, firstname)
+        r = await client.get(url, headers=hdrs, timeout=15)
+        if r.status_code == 404:
             return "not found"
-
+        if r.status_code == 403:
+            return "error: 403 Cloudflare"
+        if r.status_code != 200:
+            return f"error: HTTP {r.status_code}"
+        data = r.json()
+        return extract_score(data, score_key)
     except Exception as e:
-        return f"error: {type(e).__name__}: {str(e)[:80]}"
-    finally:
-        await ctx.close()
+        return f"error: {type(e).__name__}: {str(e)[:60]}"
 
 
-async def scrape_all(rows: list, progress_cb, log_cb) -> list:
-    from playwright.async_api import async_playwright
-    MAX_CONCURRENT = 2
+async def scrape_all(rows, cookie, score_key, progress_cb, log_cb):
+    import httpx
     scores = [""] * len(rows)
+    limits = httpx.Limits(max_connections=5, max_keepalive_connections=5)
 
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True, args=BROWSER_ARGS)
-        semaphore = asyncio.Semaphore(MAX_CONCURRENT)
+    async with httpx.AsyncClient(limits=limits, follow_redirects=True) as client:
+        semaphore = asyncio.Semaphore(5)
 
-        async def task(idx: int, row: dict):
-            url = build_url(row["lastname"], row["firstname"])
+        async def task(idx, row):
             async with semaphore:
-                score = await scrape_one(url, browser)
+                score = await fetch_score_async(
+                    client, row["lastname"], row["firstname"], cookie, score_key)
             scores[idx] = score
-            log_cb(idx, row.get("lastname","?"), row.get("firstname","?"), url, score)
+            log_cb(idx, row.get("lastname","?"), row.get("firstname","?"), score)
             progress_cb(idx + 1)
 
         await asyncio.gather(*[task(i, r) for i, r in enumerate(rows)])
-        await browser.close()
     return scores
 
 
-def run_scraper(rows, progress_cb, log_cb):
+def run_scraper(rows, cookie, score_key, progress_cb, log_cb):
     import concurrent.futures
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(asyncio.run, scrape_all(rows, progress_cb, log_cb))
+        future = pool.submit(asyncio.run,
+                             scrape_all(rows, cookie, score_key, progress_cb, log_cb))
         try:
             return future.result(timeout=600)
         except Exception as e:
             raise RuntimeError(f"{e}\n\n{traceback.format_exc()}") from e
 
-
-# ── UI ────────────────────────────────────────────────────────────────────────
+# ── Main UI ───────────────────────────────────────────────────────────────────
 st.markdown(
     '<div class="title-bar"><h1 style="margin:0">🏃 Betrail Score Scraper</h1>'
-    '<span class="badge">v1.5</span></div>', unsafe_allow_html=True)
-st.markdown("<p style='color:#888;margin-top:0.25rem'>Upload a CSV of runners → "
-            "fetch their Betrail scores → download enriched CSV.</p>",
-            unsafe_allow_html=True)
+    '<span class="badge">v2.1</span></div>', unsafe_allow_html=True)
+st.markdown(
+    "<p style='color:#888;margin-top:0.25rem'>"
+    "Fetch Betrail scores for a list of runners via the Betrail API."
+    "</p>", unsafe_allow_html=True)
+
+# ── Cloudflare explanation ─────────────────────────────────────────────────────
+with st.expander("ℹ️ How to get your Cookie — and why it may still return 403", expanded=False):
+    st.markdown("""
+**Why a cookie is needed**
+
+Betrail's API is protected by Cloudflare. Every request must carry a `cf_clearance`
+cookie that Cloudflare issues after a real browser solves a challenge.
+
+**How to get it**
+1. Open [betrail.run](https://www.betrail.run) in Chrome/Firefox (log in if you have an account)
+2. Press **F12 → Network tab**
+3. Navigate to any runner page, e.g. `/runner/chavent.pascal/overview`
+4. In the Network tab, click the request to `/api/runner/chavent.pascal`
+5. Under **Request Headers**, copy the entire `Cookie:` value
+6. Paste it in the sidebar field **"🍪 Cookie"**
+
+**Important limitation — Cloudflare IP binding**
+
+The `cf_clearance` cookie is cryptographically bound to your browser's IP address.
+When this Streamlit app (running on a Cloudflare/AWS datacenter IP) sends the same
+cookie, Cloudflare detects the IP mismatch and returns **403**.
+
+**Solutions (pick one)**
+| Option | How |
+|---|---|
+| **Run locally** | `streamlit run app.py` on your own machine — same IP as your browser ✅ |
+| **Use a VPN** | Connect your browser and the server to the same VPN exit node |
+| **Betrail account API** | If Betrail offers an authenticated API, use a Bearer token instead |
+    """)
+
 st.divider()
 
 uploaded = st.file_uploader("Upload your CSV file", type=["csv"],
@@ -329,34 +277,43 @@ if uploaded:
         st.error(f"Could not parse CSV: {e}")
 
 if df is not None:
-    if st.button("🚀 Start scraping", type="primary", use_container_width=True):
+    cookie = st.session_state.get("cookie_val", "").strip()
+    score_key = st.session_state.get("score_key", "").strip()
+
+    if not cookie:
+        st.warning("⚠️ Paste your Cookie header in the sidebar before scraping.")
+
+    col_btn, col_info = st.columns([2, 3])
+    with col_btn:
+        start = st.button("🚀 Start scraping", type="primary",
+                          use_container_width=True, disabled=not cookie)
+    with col_info:
+        st.caption("Runs at up to 5 concurrent requests. ~1–3s per runner.")
+
+    if start:
         total = len(df)
         progress_bar = st.progress(0, text="Initialising …")
         status_text  = st.empty()
-        log_area     = st.expander("📋 Live scraping log", expanded=True)
+        log_area     = st.expander("📋 Live log", expanded=True)
         log_lines    = []
 
-        def update_progress(done: int):
-            progress_bar.progress(done / total, text=f"Scraping runner {done} / {total} …")
-            status_text.markdown(
-                f"<small style='color:#888'>Completed: {done}/{total}</small>",
-                unsafe_allow_html=True)
+        def update_progress(done):
+            progress_bar.progress(done / total, text=f"Fetching {done}/{total} …")
 
-        def log_cb(idx, last, first, url, score):
-            is_score = score not in ("not found","") and not str(score).startswith("error")
-            icon = "✅" if is_score else ("⚠️" if score == "not found" else "❌")
+        def log_cb(idx, last, first, score):
+            is_ok = score not in ("not found","") and not str(score).startswith("error")
+            icon = "✅" if is_ok else ("⚠️" if score == "not found" else "❌")
             log_lines.append(f"{icon} **{last} {first}** → `{score}`")
             log_area.markdown("\n\n".join(log_lines))
 
         rows = df.to_dict(orient="records")
         try:
-            scores = run_scraper(rows, update_progress, log_cb)
+            scores = run_scraper(rows, cookie, score_key, update_progress, log_cb)
         except Exception as exc:
             st.error(f"**Scraping failed.**\n\n```\n{exc}\n```")
             st.stop()
 
         progress_bar.progress(1.0, text="Done ✓")
-        status_text.empty()
 
         result_df = df.copy()
         result_df["betrail_score"] = scores
@@ -367,14 +324,14 @@ if df is not None:
 
         st.divider()
         c1, c2, c3, c4 = st.columns(4)
-        for col, num, lbl in [(c1,total,"Total"),(c2,found,"Found"),(c3,not_found,"Not found"),(c4,errors,"Errors")]:
+        for col, num, lbl in [(c1,total,"Total"),(c2,found,"Found"),
+                               (c3,not_found,"Not found"),(c4,errors,"Errors")]:
             with col:
                 st.markdown(f'<div class="metric-box"><div class="metric-num">{num}</div>'
-                            f'<div class="metric-lbl">{lbl}</div></div>', unsafe_allow_html=True)
+                            f'<div class="metric-lbl">{lbl}</div></div>',
+                            unsafe_allow_html=True)
 
         st.divider()
-        st.subheader("Results")
-
         display_cols = []
         for c in ["name","bibNumber","competition.reportName","betrail_score"]:
             m = next((col for col in result_df.columns if col.lower() == c.lower()), None)
