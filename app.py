@@ -1,9 +1,31 @@
 import streamlit as st
 import pandas as pd
 import asyncio
-import io
+import subprocess
+import sys
 import re
 from unidecode import unidecode
+
+# ── Ensure Playwright browser binary is installed ─────────────────────────────
+# On Streamlit Community Cloud the Python package is present but the browser
+# executable is NOT pre-installed.  We run `playwright install chromium` once
+# per container start-up (cached in st.session_state so it only runs once per
+# session, but the subprocess itself is idempotent so re-running is harmless).
+@st.cache_resource(show_spinner="Installing Chromium browser (first run only) …")
+def _install_playwright():
+    result = subprocess.run(
+        [sys.executable, "-m", "playwright", "install", "chromium", "--with-deps"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        # Surface the error so we can debug it
+        raise RuntimeError(
+            f"playwright install failed:\nSTDOUT: {result.stdout}\nSTDERR: {result.stderr}"
+        )
+    return True
+
+_install_playwright()
 
 # ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -131,7 +153,10 @@ async def scrape_all(rows: list[dict], progress_cb) -> list[str]:
     scores = [""] * len(rows)
 
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True)
+        browser = await pw.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+        )
         semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 
         async def task(idx: int, row: dict):
@@ -145,6 +170,22 @@ async def scrape_all(rows: list[dict], progress_cb) -> list[str]:
         await browser.close()
 
     return scores
+
+
+def run_scraper(rows: list[dict], progress_cb) -> list[str]:
+    """
+    Run the async scraper from a synchronous Streamlit context.
+
+    Streamlit ≥ 1.18 executes in a thread that already has a running event
+    loop (via tornado).  asyncio.run() raises 'cannot run nested event loop'
+    in that situation.  We work around this by running the coroutine in a
+    brand-new thread that has its own fresh event loop.
+    """
+    import concurrent.futures
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(asyncio.run, scrape_all(rows, progress_cb))
+        return future.result()
 
 
 # ── Streamlit UI ──────────────────────────────────────────────────────────────
@@ -214,7 +255,7 @@ if df is not None:
         rows = df.to_dict(orient="records")
 
         with st.spinner("Launching browser …"):
-            scores = asyncio.run(scrape_all(rows, update_progress))
+            scores = run_scraper(rows, update_progress)
 
         progress_bar.progress(1.0, text="Done ✓")
         status_text.empty()
