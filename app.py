@@ -7,14 +7,20 @@ import re
 import traceback
 from unidecode import unidecode
 
-# ── Ensure Playwright browser binary is installed ─────────────────────────────
+# ── Install Playwright + stealth patch ───────────────────────────────────────
 @st.cache_resource(show_spinner="Installing Chromium (first run only) …")
 def _install_playwright():
-    result = subprocess.run(
+    r1 = subprocess.run(
         [sys.executable, "-m", "playwright", "install", "chromium"],
         capture_output=True, text=True,
     )
-    return result.returncode, result.stdout, result.stderr
+    # Also install playwright-stealth to bypass bot detection
+    r2 = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "playwright-stealth", "--quiet"],
+        capture_output=True, text=True,
+    )
+    code = r1.returncode or r2.returncode
+    return code, r1.stdout + r2.stdout, r1.stderr + r2.stderr
 
 _pw_code, _pw_out, _pw_err = _install_playwright()
 
@@ -43,127 +49,112 @@ h1, h2, h3 { font-family: 'Space Mono', monospace; }
 with st.sidebar:
     st.markdown("### 🔧 System status")
     if _pw_code != 0:
-        st.error(f"Chromium install failed (exit {_pw_code})")
-        with st.expander("Install log"):
-            st.code(_pw_out or "(no stdout)")
-            st.code(_pw_err or "(no stderr)")
+        st.error(f"Install failed (exit {_pw_code})")
+        with st.expander("Log"): st.code(_pw_out); st.code(_pw_err)
     else:
-        st.success("✅ Chromium installed")
+        st.success("✅ Chromium + stealth ready")
 
-    st.markdown("---")
-    st.markdown("### 🩺 Diagnostics")
-    if st.button("Test Chromium launch", use_container_width=True):
-        with st.spinner("Testing …"):
-            diag = subprocess.run([sys.executable, "-c", """
-import asyncio
-from playwright.async_api import async_playwright
-async def test():
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True,
-            args=["--no-sandbox","--disable-setuid-sandbox",
-                  "--disable-dev-shm-usage","--disable-gpu",
-                  "--single-process","--no-zygote"])
-        page = await browser.new_page()
-        await page.goto("https://example.com", timeout=15000)
-        title = await page.title()
-        await browser.close()
-        return title
-print(asyncio.run(test()))
-"""], capture_output=True, text=True, timeout=60)
-        if diag.returncode == 0:
-            st.success(f"✅ Browser works! Title: {diag.stdout.strip()}")
-        else:
-            st.error("❌ Browser launch failed")
-            st.code(diag.stdout); st.code(diag.stderr)
-
-    # ── URL preview tool ──────────────────────────────────────────────────
     st.markdown("---")
     st.markdown("### 🔗 URL preview")
     t_last  = st.text_input("Lastname",  "CHAVENT", key="diag_last")
     t_first = st.text_input("Firstname", "Pascal",  key="diag_first")
 
-    def _slugify(text):
-        text = unidecode(str(text)).lower().strip()
-        return re.sub(r"[^a-z0-9]+", "", text)
+    def _slug(text):
+        return re.sub(r"[^a-z0-9]+", "", unidecode(str(text)).lower().strip())
 
-    preview_url = f"https://www.betrail.run/runner/{_slugify(t_last)}.{_slugify(t_first)}/overview"
+    preview_url = f"https://www.betrail.run/runner/{_slug(t_last)}.{_slug(t_first)}/overview"
     st.code(preview_url, language=None)
 
-    if st.button("🔍 Scrape this runner (debug)", use_container_width=True):
+    if st.button("🔍 Debug scrape this runner", use_container_width=True):
         with st.spinner("Scraping …"):
-            debug_script = f"""
-import asyncio, re
+            dbg = subprocess.run([sys.executable, "-c", f"""
+import asyncio, re, sys
 from playwright.async_api import async_playwright
+try:
+    from playwright_stealth import stealth_async
+    HAS_STEALTH = True
+except ImportError:
+    HAS_STEALTH = False
 
 XPATH = (
     "/html/body/app-root/div/div/div/runner-page/div/div/"
     "app-runner-overview/div/div[1]/div/bt-card[1]/div/div[3]/"
     "div[1]/div/runner-level/div/runner-score/div"
 )
+URL = "{preview_url}"
 
 async def run():
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True, args=[
-            "--no-sandbox","--disable-setuid-sandbox",
-            "--disable-dev-shm-usage","--disable-gpu",
-            "--single-process","--no-zygote"
-        ])
-        page = await browser.new_page()
-        print("GOTO:", "{preview_url}")
-        resp = await page.goto("{preview_url}", wait_until="domcontentloaded", timeout=30000)
+        browser = await pw.chromium.launch(
+            headless=True,
+            args=["--no-sandbox","--disable-setuid-sandbox",
+                  "--disable-dev-shm-usage","--disable-gpu",
+                  "--single-process","--no-zygote"]
+        )
+        ctx = await browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            viewport={{"width": 1280, "height": 800}},
+            locale="fr-FR",
+            extra_http_headers={{
+                "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            }},
+        )
+        page = await ctx.new_page()
+        if HAS_STEALTH:
+            await stealth_async(page)
+            print("STEALTH: enabled")
+        else:
+            print("STEALTH: not available")
+
+        resp = await page.goto(URL, wait_until="domcontentloaded", timeout=30000)
         print("STATUS:", resp.status if resp else "None")
-
-        # Wait for Angular to hydrate
-        await page.wait_for_timeout(5000)
-
-        # Try XPath
-        try:
-            loc = page.locator("xpath=" + XPATH)
-            await loc.wait_for(timeout=10000)
-            text = (await loc.inner_text()).strip()
-            print("SCORE_XPATH:", text)
-        except Exception as e:
-            print("XPATH_FAIL:", e)
-
-        # Try CSS selector as fallback
-        try:
-            loc2 = page.locator("runner-score div")
-            count = await loc2.count()
-            print("CSS_RUNNER_SCORE_COUNT:", count)
-            if count > 0:
-                for i in range(count):
-                    t = (await loc2.nth(i).inner_text()).strip()
-                    print(f"  CSS[{{i}}]:", t)
-        except Exception as e:
-            print("CSS_FAIL:", e)
-
-        # Dump page title and URL
-        print("TITLE:", await page.title())
         print("URL:", page.url)
+        print("TITLE:", await page.title())
 
-        # Dump all text nodes that look like numbers between 0-1000
-        content = await page.content()
-        nums = re.findall(r'\\b([0-9]{{1,4}})\\b', content)
-        print("NUMERIC_TOKENS (sample):", list(set(nums))[:30])
+        if resp and resp.status == 200:
+            # Wait for Angular
+            try:
+                await page.wait_for_selector("runner-score", timeout=15000)
+                print("runner-score element: FOUND")
+            except:
+                print("runner-score element: NOT FOUND within 15s")
+
+            # XPath attempt
+            try:
+                loc = page.locator("xpath=" + XPATH)
+                await loc.wait_for(timeout=8000)
+                print("SCORE_XPATH:", (await loc.inner_text()).strip())
+            except Exception as e:
+                print("XPATH_FAIL:", e)
+
+            # CSS fallback
+            try:
+                locs = page.locator("runner-score div")
+                n = await locs.count()
+                print("CSS runner-score div count:", n)
+                for i in range(min(n, 5)):
+                    print(f"  [{i}]:", (await locs.nth(i).inner_text()).strip())
+            except Exception as e:
+                print("CSS_FAIL:", e)
 
         await browser.close()
 
 asyncio.run(run())
-"""
-            dbg = subprocess.run(
-                [sys.executable, "-c", debug_script],
-                capture_output=True, text=True, timeout=90
-            )
+"""], capture_output=True, text=True, timeout=90)
         st.markdown("**Debug output:**")
         st.code(dbg.stdout or "(no stdout)")
         if dbg.stderr:
             st.code(dbg.stderr)
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Core helpers ──────────────────────────────────────────────────────────────
 
 def slugify(text: str) -> str:
-    text = unidecode(str(text)).lower().strip()
-    return re.sub(r"[^a-z0-9]+", "", text)
+    return re.sub(r"[^a-z0-9]+", "", unidecode(str(text)).lower().strip())
 
 def build_url(lastname: str, firstname: str) -> str:
     return f"https://www.betrail.run/runner/{slugify(lastname)}.{slugify(firstname)}/overview"
@@ -174,34 +165,89 @@ XPATH = (
     "div[1]/div/runner-level/div/runner-score/div"
 )
 
+BROWSER_ARGS = [
+    "--no-sandbox", "--disable-setuid-sandbox",
+    "--disable-dev-shm-usage", "--disable-gpu",
+    "--single-process", "--no-zygote",
+]
+
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
+
+async def make_context(browser):
+    """Create a browser context that looks like a real browser."""
+    return await browser.new_context(
+        user_agent=USER_AGENT,
+        viewport={"width": 1280, "height": 800},
+        locale="fr-FR",
+        extra_http_headers={
+            "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-User": "?1",
+            "Sec-Fetch-Dest": "document",
+        },
+    )
+
 async def scrape_one(url: str, browser) -> str:
-    page = await browser.new_page()
     try:
+        from playwright_stealth import stealth_async
+        has_stealth = True
+    except ImportError:
+        has_stealth = False
+
+    ctx = await make_context(browser)
+    page = await ctx.new_page()
+    try:
+        if has_stealth:
+            await stealth_async(page)
+
         resp = await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
-        if resp and resp.status == 404:
+
+        if resp is None:
+            return "error: no response"
+        if resp.status == 403:
+            return "error: 403 blocked"
+        if resp.status == 404:
             return "not found"
-        # Give Angular time to render after DOM load
-        await page.wait_for_timeout(5000)
+        if resp.status >= 400:
+            return f"error: HTTP {resp.status}"
+
+        # Wait for Angular to render the score component
+        try:
+            await page.wait_for_selector("runner-score", timeout=15_000)
+        except Exception:
+            return "not found"
+
+        # Try XPath first
         try:
             loc = page.locator(f"xpath={XPATH}")
-            await loc.wait_for(timeout=10_000)
+            await loc.wait_for(timeout=8_000)
             text = (await loc.inner_text()).strip()
             m = re.search(r"[\d,.]+", text)
             return m.group(0) if m else text
         except Exception:
-            # Fallback: try CSS selector
-            try:
-                loc2 = page.locator("runner-score div").first
-                await loc2.wait_for(timeout=5_000)
-                text = (await loc2.inner_text()).strip()
-                m = re.search(r"[\d,.]+", text)
-                return m.group(0) if m else (text or "not found")
-            except Exception:
-                return "not found"
+            pass
+
+        # CSS fallback
+        try:
+            loc2 = page.locator("runner-score div").first
+            await loc2.wait_for(timeout=5_000)
+            text = (await loc2.inner_text()).strip()
+            m = re.search(r"[\d,.]+", text)
+            return m.group(0) if m else (text or "not found")
+        except Exception:
+            return "not found"
+
     except Exception as e:
         return f"error: {type(e).__name__}: {str(e)[:80]}"
     finally:
-        await page.close()
+        await ctx.close()
+
 
 async def scrape_all(rows: list, progress_cb, log_cb) -> list:
     from playwright.async_api import async_playwright
@@ -209,12 +255,7 @@ async def scrape_all(rows: list, progress_cb, log_cb) -> list:
     scores = [""] * len(rows)
 
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(
-            headless=True,
-            args=["--no-sandbox","--disable-setuid-sandbox",
-                  "--disable-dev-shm-usage","--disable-gpu",
-                  "--single-process","--no-zygote"],
-        )
+        browser = await pw.chromium.launch(headless=True, args=BROWSER_ARGS)
         semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 
         async def task(idx: int, row: dict):
@@ -229,6 +270,7 @@ async def scrape_all(rows: list, progress_cb, log_cb) -> list:
         await browser.close()
     return scores
 
+
 def run_scraper(rows, progress_cb, log_cb):
     import concurrent.futures
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
@@ -238,15 +280,16 @@ def run_scraper(rows, progress_cb, log_cb):
         except Exception as e:
             raise RuntimeError(f"{e}\n\n{traceback.format_exc()}") from e
 
+
 # ── UI ────────────────────────────────────────────────────────────────────────
 st.markdown(
     '<div class="title-bar"><h1 style="margin:0">🏃 Betrail Score Scraper</h1>'
-    '<span class="badge">v1.4</span></div>', unsafe_allow_html=True)
+    '<span class="badge">v1.5</span></div>', unsafe_allow_html=True)
 st.markdown("<p style='color:#888;margin-top:0.25rem'>Upload a CSV of runners → "
-            "fetch their Betrail scores → download enriched CSV.</p>", unsafe_allow_html=True)
+            "fetch their Betrail scores → download enriched CSV.</p>",
+            unsafe_allow_html=True)
 st.divider()
 
-# ── Upload ────────────────────────────────────────────────────────────────────
 uploaded = st.file_uploader("Upload your CSV file", type=["csv"],
     help="Required columns: lastname, firstname")
 
@@ -271,7 +314,6 @@ if uploaded:
     except Exception as e:
         st.error(f"Could not parse CSV: {e}")
 
-# ── Scrape ────────────────────────────────────────────────────────────────────
 if df is not None:
     if st.button("🚀 Start scraping", type="primary", use_container_width=True):
         total = len(df)
@@ -282,14 +324,14 @@ if df is not None:
 
         def update_progress(done: int):
             progress_bar.progress(done / total, text=f"Scraping runner {done} / {total} …")
-            status_text.markdown(f"<small style='color:#888'>Completed: {done}/{total}</small>",
-                                 unsafe_allow_html=True)
+            status_text.markdown(
+                f"<small style='color:#888'>Completed: {done}/{total}</small>",
+                unsafe_allow_html=True)
 
         def log_cb(idx, last, first, url, score):
-            icon = "✅" if score not in ("not found","") and not score.startswith("error") else (
-                   "⚠️" if score == "not found" else "❌")
-            line = f"{icon} [{idx+1}] {last} {first} → `{score}` | {url}"
-            log_lines.append(line)
+            is_score = score not in ("not found","") and not str(score).startswith("error")
+            icon = "✅" if is_score else ("⚠️" if score == "not found" else "❌")
+            log_lines.append(f"{icon} **{last} {first}** → `{score}`")
             log_area.markdown("\n\n".join(log_lines))
 
         rows = df.to_dict(orient="records")
@@ -305,7 +347,7 @@ if df is not None:
         result_df = df.copy()
         result_df["betrail_score"] = scores
 
-        found     = sum(1 for s in scores if s not in ("not found","","") and not str(s).startswith("error"))
+        found     = sum(1 for s in scores if s not in ("not found","") and not str(s).startswith("error"))
         not_found = sum(1 for s in scores if s == "not found")
         errors    = sum(1 for s in scores if str(s).startswith("error"))
 
@@ -334,8 +376,7 @@ if df is not None:
 
         st.dataframe(
             result_df[display_cols].style.map(style_score, subset=["betrail_score"]),
-            use_container_width=True, height=420
-        )
+            use_container_width=True, height=420)
 
         st.divider()
         st.download_button("⬇️ Download enriched CSV",
